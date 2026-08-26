@@ -46,7 +46,7 @@ def leveldb_crc(data):
     raw = crc32c(data)
     return (((raw >> 15) | (raw << 17)) + 0xA282EAD8) & 0xFFFFFFFF
 
-LEVELDB_DIR = os.path.expanduser(
+LEVELDB_DIR = os.environ.get("OPENCODE_LEVELDB_DIR") or os.path.expanduser(
     "~/Library/Application Support/ai.opencode.desktop/Local Storage/leveldb"
 )
 
