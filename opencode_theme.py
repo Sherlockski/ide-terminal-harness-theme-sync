@@ -353,6 +353,10 @@ def _hue_bucket(h):
     hl, li, sa = colorsys.rgb_to_hls(rn, gn, bn)
     if sa < 0.15:
         return "neutral"
+    # Near-white / near-black are functionally neutral text colors even when
+    # slightly warm (e.g. Dracula #f8f8f2 reads yellow in HLS at li=0.96).
+    if li > 0.90 or li < 0.10:
+        return "neutral"
     deg = hl * 360
     if deg >= 340 or deg < 20:
         return "red"
@@ -413,20 +417,29 @@ def _adjust_lightness_to_pass(color, bg, min_contrast=MIN_CONTRAST):
     return best or color
 
 
-def _pick_readable(original, hue_pool, bg, min_contrast=MIN_CONTRAST):
-    """Return original if readable, else best same-hue passer, else lightness fix."""
-    if _valid_hex(original) and contrast_ratio(original, bg) >= min_contrast:
+def _pick_readable(original, hue_pool, bg, min_contrast=MIN_CONTRAST, want=None):
+    """Return original if readable *and* purpose-correct, else substitute.
+
+    want: set of acceptable hue buckets (e.g. {'neutral'} for FG). A passing
+    original of the wrong hue (purple FG, ...) is replaced, not kept.
+    """
+    if (_valid_hex(original) and contrast_ratio(original, bg) >= min_contrast
+            and (want is None or _hue_bucket(original) in want)):
         return original
     passing = [c for c in dict.fromkeys(hue_pool) if _valid_hex(c)
-               and contrast_ratio(c, bg) >= min_contrast]
+               and contrast_ratio(c, bg) >= min_contrast
+               and (want is None or _hue_bucket(c) in want)]
     if passing:
         return max(passing, key=lambda c: contrast_ratio(c, bg))
-    # Nothing in-pool passes: shift the strongest candidate toward readability.
-    cands = ([original] if _valid_hex(original) else []) + [c for c in hue_pool if _valid_hex(c)]
-    if not cands:
-        return original
-    base = max(cands, key=lambda c: contrast_ratio(c, bg))
-    return _adjust_lightness_to_pass(base, bg, min_contrast)
+    # Nothing in-pool passes: shift the strongest purpose-correct candidate.
+    cands = [c for c in hue_pool if _valid_hex(c)
+             and (want is None or _hue_bucket(c) in want)]
+    if cands:
+        return _adjust_lightness_to_pass(
+            max(cands, key=lambda c: contrast_ratio(c, bg)), bg, min_contrast)
+    if _valid_hex(original):
+        return _adjust_lightness_to_pass(original, bg, min_contrast)
+    return original
 
 
 def harmonize_palette(bg, fg, ansi, accent=None, theme_pool=None):
@@ -448,9 +461,9 @@ def harmonize_palette(bg, fg, ansi, accent=None, theme_pool=None):
     for c in pool:
         bucketed.setdefault(_hue_bucket(c), []).append(c)
 
-    # Foreground: neutral-purpose pool (theme neutrals + original).
+    # Foreground: neutral-purpose only (never keep a passing accent hue).
     fg_pool = bucketed.get("neutral", []) + ([fg] if _valid_hex(fg) else [])
-    new_fg = _pick_readable(fg, fg_pool, bg) if _valid_hex(fg) else fg
+    new_fg = _pick_readable(fg, fg_pool, bg, want={"neutral"}) if _valid_hex(fg) else fg
 
     new_ansi = []
     for i in range(16):
@@ -473,7 +486,7 @@ def harmonize_palette(bg, fg, ansi, accent=None, theme_pool=None):
         # Bright variants (8-15) may also borrow from their normal counterpart.
         if i >= 8 and i - 8 < len(ansi) and _valid_hex(ansi[i - 8]):
             hue_pool.append(ansi[i - 8])
-        new_ansi.append(_pick_readable(orig, hue_pool, bg))
+        new_ansi.append(_pick_readable(orig, hue_pool, bg, want=want))
 
     new_accent = accent
     if _valid_hex(accent):

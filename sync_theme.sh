@@ -380,11 +380,17 @@ print(','.join(uniq))
     fi
     # FG: prefer theme text colors / most common token foreground over a
     # hardcoded gray, so light themes don't inherit dark-theme "#cccccc".
+    # FG: body text must stay neutral (dark grey on light BG). Prefer editor
+    # text keys, then the token base foreground (#333333 in Quiet Light),
+    # and only then chrome ink (activityBar etc., often an accent hue).
     if [ -z "$FG" ]; then
-        FG=$(echo "$COLORS" | jq -r '.["terminal.foreground"] // .["editor.foreground"] // .["foreground"] // .["sideBar.foreground"] // .["activityBar.foreground"] // .["tab.activeForeground"] // empty' 2>/dev/null | strip_alpha)
+        FG=$(echo "$COLORS" | jq -r '.["terminal.foreground"] // .["editor.foreground"] // .["foreground"] // empty' 2>/dev/null | strip_alpha)
     fi
     if [ -z "$FG" ] && [ -n "$TOKEN_FGS" ]; then
         FG=$(echo "$TOKEN_FGS" | tr ',' '\n' | grep -m1 -E '^#[0-9a-fA-F]{6}$' || true)
+    fi
+    if [ -z "$FG" ]; then
+        FG=$(echo "$COLORS" | jq -r '.["sideBar.foreground"] // .["activityBar.foreground"] // .["tab.activeForeground"] // empty' 2>/dev/null | strip_alpha)
     fi
     if [ -z "$FG" ]; then
         if [ "$(python3 -c "
@@ -427,6 +433,7 @@ def bucket(h):
     except Exception: return 'neutral'
     hl,li,sa=colorsys.rgb_to_hls(r/255,g/255,b/255)
     if sa<0.15: return 'neutral'
+    if li>0.90 or li<0.10: return 'neutral'
     d=hl*360
     if d>=340 or d<20: return 'red'
     if d<45: return 'orange'
@@ -451,13 +458,14 @@ def adjust(c,bg):
             d=abs(li-ol)
             if bd is None or d<bd: bd=d; best=cand
     return best or c
-def pick(orig,pool,bg):
-    if valid(orig) and cr(orig,bg)>=MIN: return orig
-    passing=[c for c in dict.fromkeys(pool) if valid(c) and cr(c,bg)>=MIN]
+def pick(orig,pool,bg,want=None):
+    if valid(orig) and cr(orig,bg)>=MIN and (want is None or bucket(orig) in want): return orig
+    passing=[c for c in dict.fromkeys(pool) if valid(c) and cr(c,bg)>=MIN and (want is None or bucket(c) in want)]
     if passing: return max(passing,key=lambda c: cr(c,bg))
-    cands=([orig] if valid(orig) else [])+[c for c in pool if valid(c)]
-    if not cands: return orig
-    return adjust(max(cands,key=lambda c: cr(c,bg)),bg)
+    cands=[c for c in pool if valid(c) and (want is None or bucket(c) in want)]
+    if cands: return adjust(max(cands,key=lambda c: cr(c,bg)),bg)
+    if valid(orig): return adjust(orig,bg)
+    return orig
 bg=os.environ.get('BG',''); g=lambda k: os.environ.get(k,'') or ''
 names=['Black','Red','Green','Yellow','Blue','Magenta','Cyan','White','BrightBlack','BrightRed','BrightGreen','BrightYellow','BrightBlue','BrightMagenta','BrightCyan','BrightWhite']
 ansi=[g('ANSI_'+n) for n in names]
@@ -476,8 +484,8 @@ if valid(fg0): pool.append(fg0)
 bmap={}
 for c in pool: bmap.setdefault(bucket(c),[]).append(c)
 slots={0:{'neutral'},8:{'neutral'},1:{'red'},9:{'red'},2:{'green'},10:{'green'},3:{'orange','yellow'},11:{'orange','yellow'},4:{'blue'},12:{'blue'},5:{'purple','magenta'},13:{'purple','magenta'},6:{'cyan'},14:{'cyan'},7:{'neutral'},15:{'neutral'}}
-fg=pick(fg0,bmap.get('neutral',[])+([fg0] if valid(fg0) else []),bg)
-cur=pick(cur0 if valid(cur0) else fg,bmap.get('neutral',[])+[fg],bg)
+fg=pick(fg0,bmap.get('neutral',[])+([fg0] if valid(fg0) else []),bg,{'neutral'})
+cur=pick(cur0 if valid(cur0) else fg,bmap.get('neutral',[])+[fg],bg,{'neutral'})
 out=[]
 for i in range(16):
     orig=ansi[i] if valid(ansi[i]) else ''
@@ -488,7 +496,7 @@ for i in range(16):
     hp=[]
     for b in slots[i]: hp+=bmap.get(b,[])
     if i>=8 and valid(ansi[i-8]): hp.append(ansi[i-8])
-    out.append(pick(orig,hp,bg))
+    out.append(pick(orig,hp,bg,slots[i]))
 for n,v in zip(names,out): print(f'ANSI_{n}={v}')
 print(f'FG={fg}')
 print(f'CURSOR={cur}')
@@ -552,6 +560,7 @@ def bucket(h):
     except Exception: return 'neutral'
     hl,li,sa=colorsys.rgb_to_hls(r/255,g/255,b/255)
     if sa<0.15: return 'neutral'
+    if li>0.90 or li<0.10: return 'neutral'
     d=hl*360
     if d>=340 or d<20: return 'red'
     if d<45: return 'orange'
