@@ -311,6 +311,181 @@ def with_alpha(hex_color, alpha):
     return f"rgba({r}, {g}, {b}, {alpha})"
 
 
+# ── Contrast + purpose-based harmonization ───────────────────────────────────
+# Ensures every foreground color (FG, ANSI 0-15, accent, cursor) meets WCAG
+# contrast against BG by substituting a same-hue theme color or, failing that,
+# shifting lightness while preserving hue/saturation. Never snaps to pure
+# white/black; the closest passing lightness is used instead.
+
+MIN_CONTRAST = 4.5
+
+def _rel_lum(h):
+    h = h.lstrip("#")[:6]
+    r, g, b = int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
+
+    def lin(c):
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def contrast_ratio(fg, bg):
+    try:
+        l1, l2 = _rel_lum(fg), _rel_lum(bg)
+    except (ValueError, IndexError):
+        return 0.0
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _valid_hex(h):
+    return isinstance(h, str) and bool(re.match(r"^#[0-9a-fA-F]{6}$", h or ""))
+
+
+def _hue_bucket(h):
+    """Classify a hex color into a hue family (or 'neutral' if desaturated)."""
+    import colorsys
+    try:
+        r, g, b = hex_to_rgb(h)
+    except (ValueError, IndexError):
+        return "neutral"
+    rn, gn, bn = r / 255, g / 255, b / 255
+    hl, li, sa = colorsys.rgb_to_hls(rn, gn, bn)
+    if sa < 0.15:
+        return "neutral"
+    deg = hl * 360
+    if deg >= 340 or deg < 20:
+        return "red"
+    if deg < 45:
+        return "orange"
+    if deg < 75:
+        return "yellow"
+    if deg < 170:
+        return "green"
+    if deg < 200:
+        return "cyan"
+    if deg < 260:
+        return "blue"
+    if deg < 295:
+        return "purple"
+    return "magenta"
+
+
+# ANSI slot -> acceptable hue families (purpose mapping)
+_SLOT_BUCKETS = {
+    0: {"neutral"}, 8: {"neutral"},
+    1: {"red"}, 9: {"red"},
+    2: {"green"}, 10: {"green"},
+    3: {"orange", "yellow"}, 11: {"orange", "yellow"},
+    4: {"blue"}, 12: {"blue"},
+    5: {"purple", "magenta"}, 13: {"purple", "magenta"},
+    6: {"cyan"}, 14: {"cyan"},
+    7: {"neutral"}, 15: {"neutral"},
+}
+
+
+def _adjust_lightness_to_pass(color, bg, min_contrast=MIN_CONTRAST):
+    """Sweep HLS lightness to find the closest passing color, hue preserved."""
+    import colorsys
+    if contrast_ratio(color, bg) >= min_contrast:
+        return color
+    try:
+        r, g, b = hex_to_rgb(color)
+    except (ValueError, IndexError):
+        return color
+    rn, gn, bn = r / 255, g / 255, b / 255
+    h, _, s = colorsys.rgb_to_hls(rn, gn, bn)
+    try:
+        _, orig_l, _ = colorsys.rgb_to_hls(rn, gn, bn)
+    except Exception:
+        orig_l = 0.5
+    best = None
+    best_dist = None
+    for i in range(0, 101):
+        li = i / 100
+        rr, gg, bb = colorsys.hls_to_rgb(h, li, s)
+        cand = rgb_to_hex(rr * 255, gg * 255, bb * 255)
+        if contrast_ratio(cand, bg) >= min_contrast:
+            dist = abs(li - orig_l)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = cand
+    return best or color
+
+
+def _pick_readable(original, hue_pool, bg, min_contrast=MIN_CONTRAST):
+    """Return original if readable, else best same-hue passer, else lightness fix."""
+    if _valid_hex(original) and contrast_ratio(original, bg) >= min_contrast:
+        return original
+    passing = [c for c in dict.fromkeys(hue_pool) if _valid_hex(c)
+               and contrast_ratio(c, bg) >= min_contrast]
+    if passing:
+        return max(passing, key=lambda c: contrast_ratio(c, bg))
+    # Nothing in-pool passes: shift the strongest candidate toward readability.
+    cands = ([original] if _valid_hex(original) else []) + [c for c in hue_pool if _valid_hex(c)]
+    if not cands:
+        return original
+    base = max(cands, key=lambda c: contrast_ratio(c, bg))
+    return _adjust_lightness_to_pass(base, bg, min_contrast)
+
+
+def harmonize_palette(bg, fg, ansi, accent=None, theme_pool=None):
+    """Harmonize FG + 16 ANSI + accent against BG. Returns (fg, ansi, accent).
+
+    theme_pool: extra theme colors (tokenColors, .colors values) used as
+    same-hue substitution candidates. Never invents pure white/black; the
+    lightness sweep preserves the source hue instead.
+    """
+    ansi = list(ansi or [])
+    while len(ansi) < 16:
+        ansi.append("")
+    pool = [c for c in (theme_pool or []) if _valid_hex(c)]
+    pool += [c for c in ansi if _valid_hex(c)]
+    if _valid_hex(accent):
+        pool.append(accent)
+
+    bucketed = {}
+    for c in pool:
+        bucketed.setdefault(_hue_bucket(c), []).append(c)
+
+    # Foreground: neutral-purpose pool (theme neutrals + original).
+    fg_pool = bucketed.get("neutral", []) + ([fg] if _valid_hex(fg) else [])
+    new_fg = _pick_readable(fg, fg_pool, bg) if _valid_hex(fg) else fg
+
+    new_ansi = []
+    for i in range(16):
+        orig = ansi[i] if i < len(ansi) and _valid_hex(ansi[i]) else ""
+        if not orig:
+            # Empty slot (e.g. theme defines no terminal.ansi*): seed from the
+            # same-hue theme pool, else fall back to FG so Ghostty always gets
+            # a readable entry instead of an inherited default.
+            same = []
+            for b in _SLOT_BUCKETS.get(i, {"neutral"}):
+                same += bucketed.get(b, [])
+            if same:
+                orig = max(same, key=lambda c: contrast_ratio(c, bg))
+            else:
+                orig = new_fg if _valid_hex(new_fg) else bg
+        want = _SLOT_BUCKETS.get(i, {"neutral"})
+        hue_pool = []
+        for b in want:
+            hue_pool += bucketed.get(b, [])
+        # Bright variants (8-15) may also borrow from their normal counterpart.
+        if i >= 8 and i - 8 < len(ansi) and _valid_hex(ansi[i - 8]):
+            hue_pool.append(ansi[i - 8])
+        new_ansi.append(_pick_readable(orig, hue_pool, bg))
+
+    new_accent = accent
+    if _valid_hex(accent):
+        want = {_hue_bucket(accent)}
+        hue_pool = []
+        for b in want:
+            hue_pool += bucketed.get(b, [])
+        new_accent = _pick_readable(accent, hue_pool, bg)
+
+    return new_fg, new_ansi, new_accent
+
+
 # ── CSS generation ───────────────────────────────────────────────────────────
 
 def generate_css(bg, fg, ansi, accent=None, selection_bg=None, selection_fg=None,
@@ -467,6 +642,12 @@ def main():
     find_match_bg = args[6]
     find_match_fg = args[7]
     ansi = args[8:24]  # 16 ANSI colors
+
+    # Purpose-based + contrast-based substitution: keep theme intent by
+    # preferring same-hue theme colors, else shift lightness (never snap to
+    # pure white/black). Theme pool here is limited to what was passed in.
+    fg, ansi, accent = harmonize_palette(bg, fg, ansi, accent,
+                                         theme_pool=list(ansi) + [fg, accent])
 
     # Pick a built-in theme ID that matches the BG luminosity.
     # The app's oc-theme-preload.js needs a KNOWN theme to provide a

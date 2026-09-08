@@ -135,7 +135,7 @@ ensure_dependencies() {
     local missing=()
     local cmd pkg
 
-    for cmd in python3 jq bc; do
+    for cmd in python3 jq; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             missing+=("$cmd")
         fi
@@ -153,7 +153,6 @@ ensure_dependencies() {
             case "$cmd" in
                 python3) pkg="python@3" ;;
                 jq) pkg="jq" ;;
-                bc) pkg="bc" ;;
                 *) pkg="$cmd" ;;
             esac
 
@@ -182,10 +181,12 @@ ensure_dependencies() {
 #   ANSI_*                     16 terminal palette colours
 #   ACCENT                     single accent colour
 #   COLORS                     compact JSON of the theme's .colors map
+#   TOKEN_FGS                  comma-separated tokenColors/semantic foregrounds
 #   EXTENSION_ID EXTENSION_DIR marketplace id + source dir of theme extension
 VSCODE_AUTO_DETECT=""
 VSCODE_PREFERRED_LIGHT=""
 VSCODE_PREFERRED_DARK=""
+TOKEN_FGS=""
 
 # Assigned dynamically in resolve_theme()/load_payload_vars()
 ANSI_Black="" ANSI_Red="" ANSI_Green="" ANSI_Yellow=""
@@ -269,7 +270,12 @@ resolve_theme() {
         BG="#1e1e1e"; FG="#cccccc"; CURSOR="#cccccc"
         SELECTION_BG="#264f78"; SELECTION_FG=""; LINE_HIGHLIGHT=""
         FIND_MATCH_BG=""; FIND_MATCH_FG=""
-        COLORS="{}"
+        COLORS="{}"; TOKEN_FGS=""
+        for _n in Black Red Green Yellow Blue Magenta Cyan White \
+                 BrightBlack BrightRed BrightGreen BrightYellow \
+                 BrightBlue BrightMagenta BrightCyan BrightWhite; do
+            printf -v "ANSI_${_n}" '%s' ""
+        done
     else
         echo "Source theme: $FOUND_FILE"
         COLORS=$(_clean_json < "$FOUND_FILE" | jq -c '.colors // {}' 2>/dev/null)
@@ -292,6 +298,41 @@ resolve_theme() {
             # create a variable local to resolve_theme()
             printf -v "ANSI_${name}" '%s' "$val"
         done
+        # Token foregrounds (syntax colors) for purpose-based substitution.
+        # Quiet Light et al. define no terminal.ansi* but carry usable hues here.
+        TOKEN_FGS=$(_clean_json < "$FOUND_FILE" | python3 -c "
+import sys, json, re
+try:
+    t = json.load(sys.stdin)
+except Exception:
+    print('')
+    sys.exit(0)
+outs = []
+for tc in (t.get('tokenColors') or []):
+    try:
+        f = (tc.get('settings') or {}).get('foreground')
+        if isinstance(f, str) and re.match(r'^#[0-9a-fA-F]{6}', f):
+            outs.append(f[:7])
+    except Exception:
+        pass
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k == 'foreground' and isinstance(v, str) and re.match(r'^#[0-9a-fA-F]{6}', v):
+                outs.append(v[:7])
+            else:
+                walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(t.get('semanticTokenColors'))
+seen = set(); uniq = []
+for c in outs:
+    cl = c.lower()
+    if cl not in seen:
+        seen.add(cl); uniq.append(c)
+print(','.join(uniq))
+" 2>/dev/null)
     fi
 
     # Diagnostic output
@@ -325,43 +366,141 @@ resolve_theme() {
         fi
     fi
 
-    # ── 5. Safe defaults ─────────────────────────────────────────────────────
-    [ -z "$BG" ]             && BG="#1e1e1e"
-    [ -z "$FG" ]             && FG="#cccccc"
+    # ── 5. Safe defaults (theme-aware, no white/black snap) ────────────────
+    # BG: BG stays as theme intent; only fill when missing via background-ish
+    # keys, then theme-name heuristic (Quiet Light -> light).
+    if [ -z "$BG" ]; then
+        BG=$(echo "$COLORS" | jq -r '.["editor.background"] // .["background"] // .["sideBar.background"] // .["activityBar.background"] // .["panel.background"] // empty' 2>/dev/null | strip_alpha)
+    fi
+    if [ -z "$BG" ]; then
+        case "${ACTIVE_THEME,,}" in
+            *light*|*quiet*) BG="#F5F5F5" ;;
+            *) BG="#1e1e1e" ;;
+        esac
+    fi
+    # FG: prefer theme text colors / most common token foreground over a
+    # hardcoded gray, so light themes don't inherit dark-theme "#cccccc".
+    if [ -z "$FG" ]; then
+        FG=$(echo "$COLORS" | jq -r '.["terminal.foreground"] // .["editor.foreground"] // .["foreground"] // .["sideBar.foreground"] // .["activityBar.foreground"] // .["tab.activeForeground"] // empty' 2>/dev/null | strip_alpha)
+    fi
+    if [ -z "$FG" ] && [ -n "$TOKEN_FGS" ]; then
+        FG=$(echo "$TOKEN_FGS" | tr ',' '\n' | grep -m1 -E '^#[0-9a-fA-F]{6}$' || true)
+    fi
+    if [ -z "$FG" ]; then
+        if [ "$(python3 -c "
+bg = '$BG'.lstrip('#')
+r, g, b = int(bg[0:2],16), int(bg[2:4],16), int(bg[4:6],16)
+print('dark' if r*0.299+g*0.587+b*0.114 < 128 else 'light')
+" 2>/dev/null)" = "dark" ]; then FG="#cccccc"; else FG="#333333"; fi
+    fi
     [ -z "$CURSOR" ]         && CURSOR="$FG"
     [ -z "$SELECTION_BG" ]   && SELECTION_BG="#264f78"
     [ -z "$SELECTION_FG" ]   && SELECTION_FG=""
     [ -z "$LINE_HIGHLIGHT" ] && LINE_HIGHLIGHT=""
 
-    # ── 6. Contrast check: ensure foreground is readable against background ──
-    CURRENT_CONTRAST=$(check_contrast "$FG" "$BG")
-    MIN_CONTRAST="4.5"
-    if [ -n "$CURRENT_CONTRAST" ] && [ "$(echo "$CURRENT_CONTRAST < $MIN_CONTRAST" | bc 2>/dev/null)" = "1" ] 2>/dev/null; then
-        echo "  Warning: foreground $FG has insufficient contrast ($CURRENT_CONTRAST:1) against background $BG"
-        # Try ANSI white (index 7) — often matches the intended terminal foreground
-        if [ -n "${ANSI_White:-}" ]; then
-            ALT_CONTRAST=$(check_contrast "$ANSI_White" "$BG")
-            if [ -n "$ALT_CONTRAST" ] && [ "$(echo "$ALT_CONTRAST >= $MIN_CONTRAST" | bc 2>/dev/null)" = "1" ] 2>/dev/null; then
-                echo "  Using terminal.ansiWhite ($ANSI_White) instead (contrast $ALT_CONTRAST:1)"
-                FG="$ANSI_White"
-                CURRENT_CONTRAST="$ALT_CONTRAST"
-            fi
-        fi
-        # If still insufficient, compute black or white (whichever contrasts better)
-        if [ -n "$CURRENT_CONTRAST" ] && [ "$(echo "$CURRENT_CONTRAST < $MIN_CONTRAST" | bc 2>/dev/null)" = "1" ] 2>/dev/null; then
-            WHITE_CONTRAST=$(check_contrast "#ffffff" "$BG")
-            BLACK_CONTRAST=$(check_contrast "#000000" "$BG")
-            if [ -n "$WHITE_CONTRAST" ] && [ -n "$BLACK_CONTRAST" ]; then
-                if [ "$(echo "$WHITE_CONTRAST > $BLACK_CONTRAST" | bc 2>/dev/null)" = "1" ] 2>/dev/null; then
-                    FG="#ffffff"
-                    CURRENT_CONTRAST="$WHITE_CONTRAST"
-                else
-                    FG="#000000"
-                    CURRENT_CONTRAST="$BLACK_CONTRAST"
-                fi
-                echo "  Using $FG instead (contrast $CURRENT_CONTRAST:1)"
-            fi
-        fi
+    # ── 6. Purpose-based + contrast-based harmonization ──────────────────────
+    # Every FG/ANSI/accent/cursor color must reach 4.5:1 vs BG. Same-hue theme
+    # colors (tokenColors + .colors) win; else lightness is shifted with hue
+    # preserved. No pure white/black snapping.
+    _harmonized=$(BG="$BG" FG="$FG" CURSOR="$CURSOR" ACCENT_PLACEHOLDER="${ACCENT:-}" COLORS="$COLORS" TOKEN_FGS="$TOKEN_FGS" \
+        ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+        ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+        ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+        ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+        python3 -c "
+import os, json, re, colorsys
+MIN=4.5
+def valid(h): return isinstance(h,str) and bool(re.match(r'^#[0-9a-fA-F]{6}\$', h or ''))
+def rgb(h):
+    h=h.lstrip('#'); return tuple(int(h[i:i+2],16) for i in (0,2,4))
+def lum(h):
+    h=h.lstrip('#')[:6]
+    r,g,b=int(h[0:2],16)/255,int(h[2:4],16)/255,int(h[4:6],16)/255
+    lin=lambda c: c/12.92 if c<=0.04045 else ((c+0.055)/1.055)**2.4
+    return 0.2126*lin(r)+0.7152*lin(g)+0.0722*lin(b)
+def cr(a,b):
+    try: l1,l2=lum(a),lum(b)
+    except Exception: return 0.0
+    hi,lo=max(l1,l2),min(l1,l2); return (hi+0.05)/(lo+0.05)
+def bucket(h):
+    try: r,g,b=rgb(h)
+    except Exception: return 'neutral'
+    hl,li,sa=colorsys.rgb_to_hls(r/255,g/255,b/255)
+    if sa<0.15: return 'neutral'
+    d=hl*360
+    if d>=340 or d<20: return 'red'
+    if d<45: return 'orange'
+    if d<75: return 'yellow'
+    if d<170: return 'green'
+    if d<200: return 'cyan'
+    if d<260: return 'blue'
+    if d<295: return 'purple'
+    return 'magenta'
+def tohex(r,g,b): return f'#{max(0,min(255,round(r))):02x}{max(0,min(255,round(g))):02x}{max(0,min(255,round(b))):02x}'
+def adjust(c,bg):
+    if cr(c,bg)>=MIN: return c
+    try: r,g,b=rgb(c)
+    except Exception: return c
+    h,ol,s=colorsys.rgb_to_hls(r/255,g/255,b/255)
+    best=None; bd=None
+    for i in range(101):
+        li=i/100
+        rr,gg,bb=colorsys.hls_to_rgb(h,li,s)
+        cand=tohex(rr*255,gg*255,bb*255)
+        if cr(cand,bg)>=MIN:
+            d=abs(li-ol)
+            if bd is None or d<bd: bd=d; best=cand
+    return best or c
+def pick(orig,pool,bg):
+    if valid(orig) and cr(orig,bg)>=MIN: return orig
+    passing=[c for c in dict.fromkeys(pool) if valid(c) and cr(c,bg)>=MIN]
+    if passing: return max(passing,key=lambda c: cr(c,bg))
+    cands=([orig] if valid(orig) else [])+[c for c in pool if valid(c)]
+    if not cands: return orig
+    return adjust(max(cands,key=lambda c: cr(c,bg)),bg)
+bg=os.environ.get('BG',''); g=lambda k: os.environ.get(k,'') or ''
+names=['Black','Red','Green','Yellow','Blue','Magenta','Cyan','White','BrightBlack','BrightRed','BrightGreen','BrightYellow','BrightBlue','BrightMagenta','BrightCyan','BrightWhite']
+ansi=[g('ANSI_'+n) for n in names]
+try: colors=json.loads(os.environ.get('COLORS') or '{}')
+except Exception: colors={}
+pool=[]
+for v in colors.values():
+    if isinstance(v,str) and re.match(r'^#[0-9a-fA-F]{6}',v): pool.append(v[:7])
+for c in (os.environ.get('TOKEN_FGS') or '').split(','):
+    if re.match(r'^#[0-9a-fA-F]{6}\$',c.strip()): pool.append(c.strip())
+pool+=[c for c in ansi if valid(c)]
+acc=os.environ.get('ACCENT_PLACEHOLDER') or ''
+if valid(acc): pool.append(acc)
+fg0=g('FG'); cur0=g('CURSOR')
+if valid(fg0): pool.append(fg0)
+bmap={}
+for c in pool: bmap.setdefault(bucket(c),[]).append(c)
+slots={0:{'neutral'},8:{'neutral'},1:{'red'},9:{'red'},2:{'green'},10:{'green'},3:{'orange','yellow'},11:{'orange','yellow'},4:{'blue'},12:{'blue'},5:{'purple','magenta'},13:{'purple','magenta'},6:{'cyan'},14:{'cyan'},7:{'neutral'},15:{'neutral'}}
+fg=pick(fg0,bmap.get('neutral',[])+([fg0] if valid(fg0) else []),bg)
+cur=pick(cur0 if valid(cur0) else fg,bmap.get('neutral',[])+[fg],bg)
+out=[]
+for i in range(16):
+    orig=ansi[i] if valid(ansi[i]) else ''
+    if not orig:
+        same=[]
+        for b in slots[i]: same+=bmap.get(b,[])
+        orig=max(same,key=lambda c: cr(c,bg)) if same else (fg if valid(fg) else bg)
+    hp=[]
+    for b in slots[i]: hp+=bmap.get(b,[])
+    if i>=8 and valid(ansi[i-8]): hp.append(ansi[i-8])
+    out.append(pick(orig,hp,bg))
+for n,v in zip(names,out): print(f'ANSI_{n}={v}')
+print(f'FG={fg}')
+print(f'CURSOR={cur}')
+" 2>/dev/null)
+    if [ -n "$_harmonized" ]; then
+        while IFS='=' read -r _k _v; do
+            case "$_k" in
+                ANSI_*|FG|CURSOR) printf -v "$_k" '%s' "$_v" ;;
+            esac
+        done <<< "$_harmonized"
+        echo "  Harmonized FG + ANSI palette vs $BG (purpose-aware, min 4.5:1)"
+        echo "  foreground          = $FG (harmonized)"
     fi
 
     # ── 6b. Locate the theme extension (id + dir) for fork installs ────────
@@ -387,6 +526,84 @@ resolve_theme() {
         [ -n "$ACCENT" ] && break
     done
     [ -z "$ACCENT" ] && ACCENT="#007acc"
+
+    # Harmonize accent vs BG the same way (same-hue pool, else lightness shift).
+    _acc_h=$(BG="$BG" ACCENT="$ACCENT" COLORS="$COLORS" TOKEN_FGS="$TOKEN_FGS" \
+        ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+        ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+        ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+        ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+        python3 -c "
+import os, json, re, colorsys
+MIN=4.5
+def valid(h): return isinstance(h,str) and bool(re.match(r'^#[0-9a-fA-F]{6}\$', h or ''))
+def lum(h):
+    h=h.lstrip('#')[:6]
+    r,g,b=int(h[0:2],16)/255,int(h[2:4],16)/255,int(h[4:6],16)/255
+    lin=lambda c: c/12.92 if c<=0.04045 else ((c+0.055)/1.055)**2.4
+    return 0.2126*lin(r)+0.7152*lin(g)+0.0722*lin(b)
+def cr(a,b):
+    try: l1,l2=lum(a),lum(b)
+    except Exception: return 0.0
+    hi,lo=max(l1,l2),min(l1,l2); return (hi+0.05)/(lo+0.05)
+def bucket(h):
+    try:
+        hh=h.lstrip('#'); r,g,b=int(hh[0:2],16),int(hh[2:4],16),int(hh[4:6],16)
+    except Exception: return 'neutral'
+    hl,li,sa=colorsys.rgb_to_hls(r/255,g/255,b/255)
+    if sa<0.15: return 'neutral'
+    d=hl*360
+    if d>=340 or d<20: return 'red'
+    if d<45: return 'orange'
+    if d<75: return 'yellow'
+    if d<170: return 'green'
+    if d<200: return 'cyan'
+    if d<260: return 'blue'
+    if d<295: return 'purple'
+    return 'magenta'
+def tohex(r,g,b): return f'#{max(0,min(255,round(r))):02x}{max(0,min(255,round(g))):02x}{max(0,min(255,round(b))):02x}'
+def adjust(c,bg):
+    if cr(c,bg)>=MIN: return c
+    hh=c.lstrip('#'); r,g,b=int(hh[0:2],16),int(hh[2:4],16),int(hh[4:6],16)
+    h,ol,s=colorsys.rgb_to_hls(r/255,g/255,b/255)
+    best=None; bd=None
+    for i in range(101):
+        li=i/100
+        rr,gg,bb=colorsys.hls_to_rgb(h,li,s)
+        cand=tohex(rr*255,gg*255,bb*255)
+        if cr(cand,bg)>=MIN:
+            d=abs(li-ol)
+            if bd is None or d<bd: bd=d; best=cand
+    return best or c
+bg=os.environ.get('BG',''); acc=os.environ.get('ACCENT','')
+pool=[]
+try: colors=json.loads(os.environ.get('COLORS') or '{}')
+except Exception: colors={}
+for v in colors.values():
+    if isinstance(v,str) and re.match(r'^#[0-9a-fA-F]{6}',v): pool.append(v[:7])
+for c in (os.environ.get('TOKEN_FGS') or '').split(','):
+    c=c.strip()
+    if re.match(r'^#[0-9a-fA-F]{6}\$',c): pool.append(c)
+for k in ['ANSI_Black','ANSI_Red','ANSI_Green','ANSI_Yellow','ANSI_Blue','ANSI_Magenta','ANSI_Cyan','ANSI_White','ANSI_BrightBlack','ANSI_BrightRed','ANSI_BrightGreen','ANSI_BrightYellow','ANSI_BrightBlue','ANSI_BrightMagenta','ANSI_BrightCyan','ANSI_BrightWhite']:
+    v=os.environ.get(k,'')
+    if valid(v): pool.append(v)
+want=bucket(acc) if valid(acc) else 'blue'
+same=[c for c in pool if bucket(c)==want]
+passing=[c for c in dict.fromkeys(same) if valid(c) and cr(c,bg)>=MIN]
+if valid(acc) and cr(acc,bg)>=MIN:
+    print(acc)
+elif passing:
+    print(max(passing,key=lambda c: cr(c,bg)))
+elif valid(acc):
+    cands=[acc]+same
+    print(adjust(max(cands,key=lambda c: cr(c,bg)),bg))
+else:
+    print(acc)
+" 2>/dev/null)
+    if [ -n "$_acc_h" ]; then
+        [ "$_acc_h" != "$ACCENT" ] && echo "  Harmonized accent $ACCENT → $_acc_h"
+        ACCENT="$_acc_h"
+    fi
 
     # ── 6d. Theme mode ────────────────────────────────────────────────────────
     # On macOS this follows the system appearance (source of truth). Elsewhere
@@ -661,7 +878,7 @@ SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8)
 PAYLOAD_VARS=(
     ACTIVE_THEME THEME_MODE BG FG CURSOR
     SELECTION_BG SELECTION_FG LINE_HIGHLIGHT FIND_MATCH_BG FIND_MATCH_FG
-    ACCENT COLORS EXTENSION_ID
+    ACCENT COLORS TOKEN_FGS EXTENSION_ID
     VSCODE_AUTO_DETECT VSCODE_PREFERRED_LIGHT VSCODE_PREFERRED_DARK
     ANSI_Black ANSI_Red ANSI_Green ANSI_Yellow
     ANSI_Blue ANSI_Magenta ANSI_Cyan ANSI_White
