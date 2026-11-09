@@ -8,9 +8,11 @@ Supported:
 - Visual Studio Code
 - Antigravity (the Codex clone one)
 - Ghostty
+- Herdr (`~/.config/herdr/config.toml` `[theme.custom]`, applied live via `herdr server reload-config`)
+- Hermes (`$HERMES_HOME/skins/sync-theme.yaml`, activated via `hermes config set display.skin sync-theme`, surfaces repaint live)
+- OpenCode CLI/TUI v2 (`~/.config/opencode/themes/sync-theme.json` + `cli.json` selection; restart opencode to apply)
+- Codex TUI (`$CODEX_HOME/themes/sync-theme.tmTheme` + `[tui] theme`; restart codex to apply)
 - maybe more, I forget.
-
-Note: OpenCode and Codex theme syncs don't actually work.
 Note: This script might require fork for it to work properly if you're missing any of the things it expects to be installed, like Ghostty.
 
 ## Multi-device sync over SSH

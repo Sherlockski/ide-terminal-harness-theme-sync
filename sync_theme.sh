@@ -652,6 +652,527 @@ reload_ghostty() {
     fi
 }
 
+apply_herdr() {
+    # Sync Herdr's UI chrome ([theme.custom] in config.toml) from the same
+    # resolved VS Code palette, then hot-reload the server so the current
+    # theme changes immediately (no restart, panes keep running).
+    # Respects HERDR_CONFIG_PATH; skips gracefully when herdr is absent
+    # (e.g. an SSH receiver without herdr installed).
+    if ! command -v herdr &>/dev/null; then
+        echo "  [debug] herdr not on PATH — skipping herdr theme sync"
+        return 0
+    fi
+    local HERDR_CONFIG="${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}"
+    mkdir -p "$(dirname "$HERDR_CONFIG")"
+    if [ -f "$HERDR_CONFIG" ]; then
+        cp -p "$HERDR_CONFIG" "$HERDR_CONFIG.bak-$(date +%Y%m%d)" 2>/dev/null || true
+    fi
+
+    # NOTE: do NOT write COLORS="${COLORS:-{}}" here. POSIX shells end the
+    # expansion at the first } (default "{" plus a literal "}"), so a
+    # non-empty COLORS would gain a trailing brace and fail to parse.
+    if [ -z "$COLORS" ]; then COLORS="{}"; fi
+
+    BG="$BG" FG="$FG" ACCENT="$ACCENT" \
+    SELECTION_BG="${SELECTION_BG:-}" SELECTION_FG="${SELECTION_FG:-}" LINE_HIGHLIGHT="${LINE_HIGHLIGHT:-}" \
+    COLORS="$COLORS" THEME_MODE="${THEME_MODE:-THEME_MODE_DARK}" HERDR_CONFIG="$HERDR_CONFIG" \
+    ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+    ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+    ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+    ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+    python3 - <<'PYEOF'
+import json, os, re
+
+path = os.environ["HERDR_CONFIG"]
+def g(k): return (os.environ.get(k) or "").strip()
+def valid(h): return isinstance(h, str) and bool(re.match(r'^#[0-9a-fA-F]{6}$', h or ''))
+def first(*vals):
+    for v in vals:
+        if valid(v): return v
+    return ""
+
+try: colors = json.loads(os.environ.get("COLORS") or "{}")
+except Exception: colors = {}
+def ckey(*keys):
+    for k in keys:
+        v = (colors.get(k) or "")[:7]
+        if valid(v): return v
+    return ""
+
+bg, fg, accent = g("BG"), g("FG"), g("ACCENT")
+sel_bg, sel_fg, line_hl = g("SELECTION_BG"), g("SELECTION_FG"), g("LINE_HIGHLIGHT")
+surface = ckey("titleBar.activeBackground", "sideBar.background", "activityBar.background", "panel.background")
+
+tokens = {
+    "panel_bg":      first(bg),
+    "sidebar_bg":    first(surface, bg),
+    "active_row_bg": first(sel_bg, line_hl, surface),
+    "selection_bg":  first(sel_bg, line_hl),
+    "surface0":      first(surface, bg),
+    "surface1":      first(sel_bg, surface),
+    "surface_dim":   first(bg),
+    "overlay0":      first(g("ANSI_BrightBlack"), sel_fg, fg),
+    "overlay1":      first(fg),
+    "text":          first(fg),
+    "subtext0":      first(sel_fg, g("ANSI_BrightBlack"), fg),
+    "mauve":         first(g("ANSI_BrightMagenta"), g("ANSI_Magenta")),
+    "green":         first(g("ANSI_BrightGreen"), g("ANSI_Green")),
+    "yellow":        first(g("ANSI_BrightYellow"), g("ANSI_Yellow")),
+    "red":           first(g("ANSI_BrightRed"), g("ANSI_Red")),
+    "blue":          first(g("ANSI_BrightBlue"), g("ANSI_Blue")),
+    "teal":          first(g("ANSI_BrightCyan"), g("ANSI_Cyan")),
+    "peach":         first(g("ANSI_BrightYellow"), g("ANSI_Yellow")),
+    "accent":        first(accent),
+}
+tokens = {k: v for k, v in tokens.items() if valid(v)}
+dark = os.environ.get("THEME_MODE", "THEME_MODE_DARK") != "THEME_MODE_LIGHT"
+base = "catppuccin" if dark else "catppuccin-latte"
+
+text = ""
+if os.path.exists(path):
+    with open(path) as f: text = f.read()
+if not text.endswith("\n") and text: text += "\n"
+
+# Drop previously synced [theme.custom] blocks (plus light/dark subtables).
+lines = text.splitlines(keepends=True)
+out, skipping = [], False
+for line in lines:
+    s = line.strip()
+    if re.match(r'^\[theme\.custom(\.\w+)?\s*\]', s):
+        skipping = True
+        continue
+    if skipping and re.match(r'^\[.*\]', s):
+        skipping = False
+    if not skipping: out.append(line)
+text = "".join(out)
+
+# Ensure [theme] exists with a mode-matching base; manual selection stays
+# off so the synced palette wins (auto_switch = false).
+if re.search(r'(?m)^\[theme\]\s*$', text):
+    def fix_section(m):
+        body = m.group(0)
+        body = re.sub(r'(?m)^name\s*=.*$', f'name = "{base}"', body)
+        body = re.sub(r'(?m)^auto_switch\s*=.*$', 'auto_switch = false', body)
+        if not re.search(r'(?m)^name\s*=', body): body += f'\nname = "{base}"'
+        if not re.search(r'(?m)^auto_switch\s*=', body): body += '\nauto_switch = false'
+        return body
+    text = re.sub(r'(?m)^\[theme\]\s*$\n(?:^(?!\s*\[).*\n?)*', fix_section, text, count=1)
+else:
+    if text and not text.endswith("\n\n"): text += "\n"
+    text += f'[theme]\nname = "{base}"\nauto_switch = false\n'
+
+text = text.rstrip() + "\n\n[theme.custom]\n"
+for k, v in tokens.items(): text += f'{k} = "{v}"\n'
+with open(path, "w") as f: f.write(text)
+print(f"  Herdr theme → {base} + {len(tokens)} synced tokens ({path})")
+PYEOF
+
+    if herdr server reload-config 2>/dev/null; then
+        echo "  Herdr config reloaded (theme live, panes untouched)"
+    else
+        echo "  [debug] herdr server not running — theme applies on next start"
+    fi
+}
+
+apply_hermes() {
+    # Write a Hermes skin (skins/sync-theme.yaml) from the same resolved VS
+    # Code palette and activate it. The gateway's skin watcher repaints every
+    # surface live (~a second), so no restart is needed.
+    # Respects HERMES_HOME (profile homes keep their own skins/). The skin file
+    # is always written (pure python); only activation needs the hermes CLI,
+    # so an SSH receiver without hermes still gets the file for next start.
+    local HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
+    local SKIN="$HERMES_HOME_DIR/skins/sync-theme.yaml"
+    mkdir -p "$(dirname "$SKIN")"
+    if [ -f "$SKIN" ]; then
+        cp -p "$SKIN" "$SKIN.bak-$(date +%Y%m%d)" 2>/dev/null || true
+    fi
+
+    # NOTE: same shell-quirk guard as apply_herdr — never use ${VAR:-{}}.
+    if [ -z "$COLORS" ]; then COLORS="{}"; fi
+
+    ACTIVE_THEME="$ACTIVE_THEME" BG="$BG" FG="$FG" ACCENT="$ACCENT" \
+    SELECTION_BG="${SELECTION_BG:-}" SELECTION_FG="${SELECTION_FG:-}" LINE_HIGHLIGHT="${LINE_HIGHLIGHT:-}" \
+    COLORS="$COLORS" THEME_MODE="${THEME_MODE:-THEME_MODE_DARK}" SKIN="$SKIN" \
+    ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+    ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+    ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+    ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+    python3 - <<'PYEOF'
+import json, os, re
+
+path = os.environ["SKIN"]
+def g(k): return (os.environ.get(k) or "").strip()
+def valid(h): return isinstance(h, str) and bool(re.match(r'^#[0-9a-fA-F]{6}$', h or ''))
+def first(*vals):
+    for v in vals:
+        if valid(v): return v
+    return ""
+
+try: colors = json.loads(os.environ.get("COLORS") or "{}")
+except Exception: colors = {}
+def ckey(*keys):
+    for k in keys:
+        v = (colors.get(k) or "")[:7]
+        if valid(v): return v
+    return ""
+
+bg, fg, accent = g("BG"), g("FG"), g("ACCENT")
+sel_bg, sel_fg, line_hl = g("SELECTION_BG"), g("SELECTION_FG"), g("LINE_HIGHLIGHT")
+subtext = first(sel_fg, g("ANSI_BrightBlack"), fg)
+surface = ckey("titleBar.activeBackground", "sideBar.background", "activityBar.background", "panel.background")
+border = surface if (valid(surface) and surface.lower() != bg.lower()) else first(g("ANSI_BrightBlack"), subtext, fg)
+sel = first(sel_bg, line_hl, surface)
+green = first(g("ANSI_BrightGreen"), g("ANSI_Green"))
+yellow = first(g("ANSI_BrightYellow"), g("ANSI_Yellow"))
+red = first(g("ANSI_BrightRed"), g("ANSI_Red"))
+blue = first(g("ANSI_BrightBlue"), g("ANSI_Blue"))
+magenta = first(g("ANSI_BrightMagenta"), g("ANSI_Magenta"))
+cyan = first(g("ANSI_BrightCyan"), g("ANSI_Cyan"))
+label = first(magenta, cyan, accent, fg)
+
+# Key set mirrors hermes_cli/skin_engine.py built-ins; missing engine keys
+# fall back to the default skin, unknown keys are ignored.
+palette = {
+    "background": bg,
+    "banner_border": border, "banner_title": fg, "banner_accent": accent,
+    "banner_dim": subtext, "banner_text": fg,
+    "ui_accent": accent, "ui_label": label,
+    "ui_ok": green, "ui_warn": yellow, "ui_error": red,
+    "prompt": fg, "input_rule": accent, "response_border": first(blue, accent),
+    "status_bar_bg": first(surface, bg), "status_bar_text": fg,
+    "status_bar_strong": accent, "status_bar_dim": subtext,
+    "status_bar_good": green, "status_bar_warn": yellow,
+    "status_bar_bad": red, "status_bar_critical": first(g("ANSI_BrightRed"), red),
+    "session_label": first(cyan, accent), "session_border": border,
+    "completion_menu_bg": first(surface, bg),
+    "completion_menu_current_bg": first(sel, surface),
+    "completion_menu_meta_bg": first(surface, bg),
+    "completion_menu_meta_current_bg": first(sel, surface),
+    "selection_bg": first(sel, surface),
+    "shell_dollar": first(green, accent), "voice_status_bg": first(surface, bg),
+}
+palette = {k: v for k, v in palette.items() if valid(v)}
+src = re.sub(r'[\r\n"]+', ' ', g("ACTIVE_THEME")).strip() or "unknown theme"
+lines = ["name: sync-theme",
+         f'description: "Auto-synced from {src} by sync_theme.sh"',
+         "colors:"]
+for k, v in palette.items(): lines.append(f'  {k}: "{v}"')
+text = "\n".join(lines) + "\n"
+with open(path, "w") as f: f.write(text)
+
+# Structural check (pyyaml is not a script dependency): every color line
+# must be `  key: "#rrggbb"`.
+bad = [ln for ln in text.splitlines()[3:] if not re.match(r'^  [a-z_]+: "#[0-9a-fA-F]{6}"$', ln)]
+if bad:
+    print(f"  [warn] hermes skin failed validation: {bad[:3]}")
+else:
+    print(f"  Hermes skin → sync-theme + {len(palette)} tokens ({path})")
+try:
+    import yaml  # optional, when present
+    d = yaml.safe_load(text)
+    assert isinstance(d.get("colors"), dict) and d.get("name") == "sync-theme"
+except ImportError:
+    pass
+except Exception as e:
+    print(f"  [warn] hermes skin YAML did not parse: {e}")
+PYEOF
+
+    # Activate only when needed; the writer path above is the safe one
+    # (never hand-edit config.yaml).
+    if ! command -v hermes &>/dev/null; then
+        echo "  [debug] hermes not on PATH — skin file written; activate with: hermes config set display.skin sync-theme"
+    elif hermes config get display.skin 2>/dev/null | grep -q 'sync-theme'; then
+        echo "  Hermes skin already active (sync-theme)"
+    elif hermes config set display.skin sync-theme 2>/dev/null; then
+        echo "  Hermes skin activated (sync-theme — surfaces repaint live)"
+    else
+        echo "  [debug] hermes config set failed — skin file written; activate with: hermes config set display.skin sync-theme"
+    fi
+}
+
+apply_opencode() {
+    # OpenCode CLI/TUI v2 native themes (opencode.ai/docs/cli/theme): generate
+    # a sync-theme.json in the global themes dir and select it in cli.json.
+    # Replaces the old Chromium-LevelDB CSS hack. Restart opencode to pick up
+    # a newly added theme file.
+    local THEMES_DIR="$HOME/.config/opencode/themes"
+    local CLI_JSON="$HOME/.config/opencode/cli.json"
+    mkdir -p "$THEMES_DIR" "$(dirname "$CLI_JSON")"
+    local THEME_JSON="$THEMES_DIR/sync-theme.json"
+    [ -f "$THEME_JSON" ] && cp -p "$THEME_JSON" "$THEME_JSON.bak-$(date +%Y%m%d)" 2>/dev/null || true
+    [ -f "$CLI_JSON" ] && cp -p "$CLI_JSON" "$CLI_JSON.bak-$(date +%Y%m%d)" 2>/dev/null || true
+
+    # NOTE: same shell-quirk guard as apply_herdr — never use ${VAR:-{}}.
+    if [ -z "$COLORS" ]; then COLORS="{}"; fi
+
+    # Pre-strip // comments + trailing commas (cli.json may be jsonc); the
+    # python below parses this preferentially so no existing key is lost.
+    CLI_JSON_CLEAN=""
+    if [ -f "$CLI_JSON" ]; then CLI_JSON_CLEAN=$(_clean_json < "$CLI_JSON" 2>/dev/null); fi
+
+    ACTIVE_THEME="$ACTIVE_THEME" BG="$BG" FG="$FG" ACCENT="$ACCENT" \
+    SELECTION_BG="${SELECTION_BG:-}" SELECTION_FG="${SELECTION_FG:-}" LINE_HIGHLIGHT="${LINE_HIGHLIGHT:-}" \
+    COLORS="$COLORS" THEME_MODE="${THEME_MODE:-THEME_MODE_DARK}" \
+    THEME_JSON="$THEME_JSON" CLI_JSON="$CLI_JSON" CLI_JSON_CLEAN="$CLI_JSON_CLEAN" \
+    ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+    ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+    ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+    ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+    python3 - <<'PYEOF'
+import colorsys, json, os, re, sys
+
+def g(k): return (os.environ.get(k) or "").strip()
+def valid(h): return isinstance(h, str) and bool(re.match(r'^#[0-9a-fA-F]{6}$', h or ''))
+def first(*vals):
+    for v in vals:
+        if valid(v): return v
+    return ""
+def rgb(h):
+    h = h.lstrip('#'); return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+try: colors = json.loads(os.environ.get("COLORS") or "{}")
+except Exception: colors = {}
+def ckey(*keys):
+    for k in keys:
+        v = (colors.get(k) or "")[:7]
+        if valid(v): return v
+    return ""
+
+bg, fg, accent = g("BG"), g("FG"), g("ACCENT")
+if not (valid(bg) and valid(fg)):
+    print("  [debug] opencode skipped: no resolved background/foreground")
+    sys.exit(0)
+dark = os.environ.get("THEME_MODE", "THEME_MODE_DARK") != "THEME_MODE_LIGHT"
+mode = "dark" if dark else "light"
+sel_bg, sel_fg, line_hl = g("SELECTION_BG"), g("SELECTION_FG"), g("LINE_HIGHLIGHT")
+subtext = first(sel_fg, g("ANSI_BrightBlack"), fg)
+surface = ckey("titleBar.activeBackground", "sideBar.background", "activityBar.background", "panel.background")
+border = surface if (valid(surface) and surface.lower() != bg.lower()) else first(g("ANSI_BrightBlack"), subtext, fg)
+sel = first(sel_bg, line_hl, surface)
+
+# Seeds: bright variants read better on dark, normal variants on light.
+if dark:
+    R, Y, G, B, M, C = (first(g("ANSI_BrightRed"), g("ANSI_Red")),
+        first(g("ANSI_BrightYellow"), g("ANSI_Yellow")),
+        first(g("ANSI_BrightGreen"), g("ANSI_Green")),
+        first(g("ANSI_BrightBlue"), g("ANSI_Blue")),
+        first(g("ANSI_BrightMagenta"), g("ANSI_Magenta")),
+        first(g("ANSI_BrightCyan"), g("ANSI_Cyan")))
+else:
+    R, Y, G, B, M, C = (first(g("ANSI_Red"), g("ANSI_BrightRed")),
+        first(g("ANSI_Yellow"), g("ANSI_BrightYellow")),
+        first(g("ANSI_Green"), g("ANSI_BrightGreen")),
+        first(g("ANSI_Blue"), g("ANSI_BrightBlue")),
+        first(g("ANSI_Magenta"), g("ANSI_BrightMagenta")),
+        first(g("ANSI_Cyan"), g("ANSI_BrightCyan")))
+
+def tohex(r, gg, b): return f'#{max(0, min(255, round(r))):02x}{max(0, min(255, round(gg))):02x}{max(0, min(255, round(b))):02x}'
+def scale(seed, achromatic=False):
+    if valid(seed) and not achromatic:
+        r, gg, b = rgb(seed)
+        h, _, s = colorsys.rgb_to_hls(r / 255, gg / 255, b / 255)
+    else:
+        h, s = 0.0, 0.0
+    ls = [0.87, 0.77, 0.67, 0.57, 0.47, 0.39, 0.31, 0.23, 0.15]
+    if not dark: ls = ls[::-1]
+    out = {}
+    for step, li in zip(["100", "200", "300", "400", "500", "600", "700", "800", "900"], ls):
+        rr, gg2, bb = colorsys.hls_to_rgb(h, li, s)
+        out[step] = tohex(rr * 255, gg2 * 255, bb * 255)
+    return out
+
+def blend(a, b):
+    if not (valid(a) and valid(b)): return first(a, b)
+    ra, ga, ba = rgb(a); rb, gb, bb = rgb(b)
+    return tohex((ra + rb) / 2, (ga + gb) / 2, (ba + bb) / 2)
+
+def accent_hue_name(h):
+    if not valid(h): return "blue"
+    r, gg, b = rgb(h)
+    d, _, _ = colorsys.rgb_to_hls(r / 255, gg / 255, b / 255)
+    d *= 360
+    if d >= 340 or d < 20: return "red"
+    if d < 45: return "orange"
+    if d < 75: return "yellow"
+    if d < 170: return "green"
+    if d < 200: return "cyan"
+    if d < 260: return "blue"
+    return "purple"
+
+hue = {
+    "gray": scale("", achromatic=True),
+    "red": scale(R), "orange": scale(blend(R, Y)), "yellow": scale(Y),
+    "green": scale(G), "cyan": scale(C), "blue": scale(B), "purple": scale(M),
+    "accent": f"$hue.{accent_hue_name(accent)}",
+    "interactive": "$hue.blue", "neutral": "$hue.gray",
+}
+base = {
+    "categorical": ["accent", "blue", "green", "purple"],
+    "text": {"base": fg, "muted": subtext},
+    "background": {"base": bg, "raised": {"base": first(surface, bg)}},
+    "border": {"base": border},
+    "diff": {"added": {"base": first(G, fg)}, "removed": {"base": first(R, fg)}},
+    "syntax": {
+        "comment": subtext, "keyword": first(M, fg), "function": first(B, fg),
+        "variable": fg, "string": first(G, fg), "number": first(Y, fg),
+        "type": first(C, fg), "operator": fg, "punctuation": subtext,
+    },
+    "markdown": {
+        "text": fg, "heading": fg, "link": first(B, accent),
+        "code": first(G, fg),
+    },
+}
+theme = {
+    "$schema": "https://opencode.ai/theme.json",
+    "base": base,
+    mode: {"hue": hue},
+}
+tj = os.environ["THEME_JSON"]
+with open(tj, "w") as f: json.dump(theme, f, indent=2) ; f.write("\n")
+
+# Structural check: reload and require a complete hue table.
+d = json.load(open(tj))
+hh = d.get(mode, {}).get("hue", {})
+need = {"gray", "red", "orange", "yellow", "green", "cyan", "blue", "purple"}
+ok = need.issubset(hh) and all(isinstance(hh[h], dict) and len(hh[h]) == 9 for h in need)
+if not ok:
+    print("  [warn] opencode theme failed validation")
+else:
+    print(f"  OpenCode theme → sync-theme ({mode}) + {len(base)} token groups ({tj})")
+
+# Select it in cli.json, preserving every other key (pre-cleaned of
+# // comments / trailing commas by _clean_json).
+cj = os.environ["CLI_JSON"]
+cfg = {}
+raw = (os.environ.get("CLI_JSON_CLEAN") or "").strip()
+if raw:
+    try:
+        cfg = json.loads(raw)
+    except Exception:
+        cfg = {}
+if not isinstance(cfg, dict): cfg = {}
+cfg["theme"] = {"name": "sync-theme", "mode": mode}
+with open(cj, "w") as f: json.dump(cfg, f, indent=2); f.write("\n")
+print("  OpenCode cli.json → theme sync-theme (restart opencode to apply)")
+PYEOF
+}
+
+apply_codex() {
+    # Codex TUI native themes: a sync-theme.tmTheme under $CODEX_HOME/themes,
+    # selected via [tui] theme in config.toml. Replaces the dead
+    # [desktop.appearanceDarkChromeTheme] block (nothing reads those keys) and
+    # the daemon kill that went with it. Restart codex to apply.
+    local CODEX_HOME_DIR="${CODEX_HOME:-$HOME/.codex}"
+    local CODEX_CONFIG="$CODEX_HOME_DIR/config.toml"
+    local THEMES_DIR="$CODEX_HOME_DIR/themes"
+    mkdir -p "$THEMES_DIR"
+    local TMTHEME="$THEMES_DIR/sync-theme.tmTheme"
+    [ -f "$TMTHEME" ] && cp -p "$TMTHEME" "$TMTHEME.bak-$(date +%Y%m%d)" 2>/dev/null || true
+    [ -f "$CODEX_CONFIG" ] && cp -p "$CODEX_CONFIG" "$CODEX_CONFIG.bak-$(date +%Y%m%d)" 2>/dev/null || true
+
+    if [ -z "$COLORS" ]; then COLORS="{}"; fi
+
+    ACTIVE_THEME="$ACTIVE_THEME" BG="$BG" FG="$FG" ACCENT="$ACCENT" CURSOR="${CURSOR:-}" \
+    SELECTION_BG="${SELECTION_BG:-}" SELECTION_FG="${SELECTION_FG:-}" LINE_HIGHLIGHT="${LINE_HIGHLIGHT:-}" \
+    COLORS="$COLORS" CODEX_CONFIG="$CODEX_CONFIG" TMTHEME="$TMTHEME" \
+    ANSI_Black="$ANSI_Black" ANSI_Red="$ANSI_Red" ANSI_Green="$ANSI_Green" ANSI_Yellow="$ANSI_Yellow" \
+    ANSI_Blue="$ANSI_Blue" ANSI_Magenta="$ANSI_Magenta" ANSI_Cyan="$ANSI_Cyan" ANSI_White="$ANSI_White" \
+    ANSI_BrightBlack="$ANSI_BrightBlack" ANSI_BrightRed="$ANSI_BrightRed" ANSI_BrightGreen="$ANSI_BrightGreen" ANSI_BrightYellow="$ANSI_BrightYellow" \
+    ANSI_BrightBlue="$ANSI_BrightBlue" ANSI_BrightMagenta="$ANSI_BrightMagenta" ANSI_BrightCyan="$ANSI_BrightCyan" ANSI_BrightWhite="$ANSI_BrightWhite" \
+    python3 - <<'PYEOF'
+import json, os, re, sys
+
+def g(k): return (os.environ.get(k) or "").strip()
+def valid(h): return isinstance(h, str) and bool(re.match(r'^#[0-9a-fA-F]{6}$', h or ''))
+def first(*vals):
+    for v in vals:
+        if valid(v): return v
+    return ""
+
+bg, fg, accent = g("BG"), g("FG"), g("ACCENT")
+if not (valid(bg) and valid(fg)):
+    print("  [debug] codex skipped: no resolved background/foreground")
+    sys.exit(0)
+sel_bg, sel_fg = g("SELECTION_BG"), g("SELECTION_FG")
+subtext = first(sel_fg, g("ANSI_BrightBlack"), fg)
+caret = first(g("CURSOR"), fg)
+green = first(g("ANSI_BrightGreen"), g("ANSI_Green"), fg)
+yellow = first(g("ANSI_BrightYellow"), g("ANSI_Yellow"), fg)
+red = first(g("ANSI_BrightRed"), g("ANSI_Red"), fg)
+blue = first(g("ANSI_BrightBlue"), g("ANSI_Blue"), fg)
+magenta = first(g("ANSI_BrightMagenta"), g("ANSI_Magenta"), fg)
+cyann = first(g("ANSI_BrightCyan"), g("ANSI_Cyan"), fg)
+
+def rule(scope, color, font_style=None):
+    style = f"<key>fontStyle</key><string>{font_style}</string>" if font_style else ""
+    return (f"<dict><key>name</key><string>{scope}</string>"
+            f"<key>scope</key><string>{scope}</string>"
+            f"<key>settings</key><dict><key>foreground</key><string>{color}</string>{style}</dict></dict>")
+
+lh = f"<key>lineHighlight</key><string>{g('LINE_HIGHLIGHT')}</string>" if valid(g("LINE_HIGHLIGHT")) else ""
+tm = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>name</key><string>Sync Theme</string>
+<key>settings</key><array><dict>
+<key>settings</key><dict>
+<key>foreground</key><string>{fg}</string>
+<key>background</key><string>{bg}</string>
+<key>caret</key><string>{caret}</string>
+<key>selection</key><string>{first(sel_bg, bg)}</string>
+{lh}
+<key>invisibles</key><string>{subtext}</string>
+</dict></dict>
+{rule("comment", subtext, "italic")}
+{rule("keyword", magenta)}
+{rule("string", green)}
+{rule("constant.numeric", yellow)}
+{rule("entity.name.function", blue)}
+{rule("entity.name.type", cyann)}
+{rule("variable", fg)}
+{rule("punctuation", subtext)}
+</array></dict></plist>
+"""
+tp = os.environ["TMTHEME"]
+with open(tp, "w") as f: f.write(tm)
+print(f"  Codex theme → sync-theme.tmTheme ({tp})")
+
+# Select it via [tui] theme (config_toml.tui.theme); drop the dead
+# [desktop.appearanceDarkChromeTheme] blocks this script used to write.
+cp = os.environ["CODEX_CONFIG"]
+if not os.path.exists(cp):
+    print("  [debug] no codex config.toml — theme file written; add [tui] theme = \"sync-theme\" after onboarding")
+    sys.exit(0)
+with open(cp) as f: text = f.read()
+if not text.endswith("\n") and text: text += "\n"
+lines, out, skipping = text.splitlines(keepends=True), [], False
+for line in lines:
+    s = line.strip()
+    if re.match(r'^\[desktop\.appearanceDarkChromeTheme(\.\w+)?\s*\]', s):
+        skipping = True
+        continue
+    if skipping and re.match(r'^\[.*\]', s):
+        skipping = False
+    if skipping: continue
+    if re.match(r'^appearanceDarkCodeThemeId\s*=\s*"codex"\s*$', s):
+        continue
+    out.append(line)
+text = "".join(out)
+if re.search(r'(?m)^\[tui\]\s*$', text):
+    def fix_section(m):
+        body = m.group(0)
+        body = re.sub(r'(?m)^theme\s*=.*$', 'theme = "sync-theme"', body)
+        if not re.search(r'(?m)^theme\s*=', body): body += '\ntheme = "sync-theme"'
+        return body
+    text = re.sub(r'(?m)^\[tui\]\s*$\n(?:^(?!\s*\[).*\n?)*', fix_section, text, count=1)
+else:
+    text = text.rstrip() + '\n\n[tui]\ntheme = "sync-theme"\n'
+with open(cp, "w") as f: f.write(text)
+print("  Codex config.toml → [tui] theme sync-theme (restart codex to apply)")
+PYEOF
+}
+
 install_via_cli() {
     local CLI="$1" ID="$2"
     echo "  Installing $ID via $CLI …"
@@ -697,10 +1218,6 @@ set_theme_name() {
 
 apply_targets() {
 
-    # OPENCODE_PY points at opencode_theme.py — bundled on this machine,
-    # staged to a temp file when running as the SSH receiver.
-    : "${OPENCODE_PY:=$SCRIPT_DIR/opencode_theme.py}"
-
     # ── 7. Write Ghostty config ──────────────────────────────────────────────
     # Remove old inline sync block, stale config-file directive, and theme lines
     sed_inplace '/^[[:space:]]*# BEGIN SYNC_THEME/,/^[[:space:]]*# END SYNC_THEME/d' "$GHOSTTY_CONFIG"
@@ -738,6 +1255,12 @@ apply_targets() {
 
     reload_ghostty
 
+    # ── 7b. Herdr TUI (config-file driven, hot-reloaded) ───────────────────
+    apply_herdr
+
+    # ── 7c. Hermes TUI/CLI/desktop (skins/sync-theme.yaml, live repaint) ──
+    apply_hermes
+
     # ── 8. Install theme extension + sync to fork editors ───────────────────
     # Forks share the VS Code marketplace, so install the extension and set the
     # theme name rather than extracting colours as colorCustomizations.
@@ -761,11 +1284,10 @@ apply_targets() {
         fi
 
         if [ "$NAME" = "OpenCode" ]; then
-            # OpenCode Desktop reads both settings.json AND LevelDB (below).
-            # Set workbench.colorTheme for the native theme engine, then
-            # overlay custom CSS via LevelDB for colour-precise accent control.
+            # OpenCode editor fork: set workbench.colorTheme for its native
+            # theme engine (CLI/TUI theming is handled by apply_opencode).
             set_theme_name "$SETTINGS"
-            echo "Synced theme name to OpenCode (workbench.colorTheme + LevelDB overlay)"
+            echo "Synced theme name to OpenCode (workbench.colorTheme)"
         else
             # Other forks (VS Code, Cursor, etc.) use settings.json theme
             set_theme_name "$SETTINGS"
@@ -773,29 +1295,8 @@ apply_targets() {
         fi
     done
 
-    # ── 9. OpenCode Desktop LevelDB (colour-precise CSS injection) ─────────
-    # The Desktop app's oc-theme-preload.js reads:
-    #   opencode-theme-id       → any non-"oc-2" value activates custom CSS
-    #   opencode-theme-css-dark → CSS variables injected on dark mode
-    #   opencode-theme-css-light→ CSS variables injected on light mode
-    # We write these directly into Chromium's LevelDB journal.
-    OPENCODE_LDB="$APP_SUPPORT_DIR/ai.opencode.desktop/Local Storage/leveldb"
-
-    if [ -d "$OPENCODE_LDB" ] && [ -n "$BG" ] && [ -n "$FG" ] && [ -n "$COLORS" ] && [ -f "$OPENCODE_PY" ]; then
-        ANSI_LIST=(
-            "${ANSI_Black:-#000000}"   "${ANSI_Red:-#cc0000}"   "${ANSI_Green:-#4e9a06}"   "${ANSI_Yellow:-#c4a000}"
-            "${ANSI_Blue:-#3465a4}"   "${ANSI_Magenta:-#75507b}" "${ANSI_Cyan:-#06989a}"   "${ANSI_White:-#d3d7cf}"
-            "${ANSI_BrightBlack:-#555753}" "${ANSI_BrightRed:-#ef2929}" "${ANSI_BrightGreen:-#8ae234}" "${ANSI_BrightYellow:-#fce94f}"
-            "${ANSI_BrightBlue:-#729fcf}" "${ANSI_BrightMagenta:-#ad7fa8}" "${ANSI_BrightCyan:-#34e2e2}" "${ANSI_BrightWhite:-#eeeeee}"
-        )
-
-        OPENCODE_LEVELDB_DIR="$OPENCODE_LDB" \
-        python3 "$OPENCODE_PY" \
-            "$BG" "$FG" "$ACCENT" \
-            "${SELECTION_BG:-}" "${SELECTION_FG:-}" "${LINE_HIGHLIGHT:-}" "${FIND_MATCH_BG:-}" "${FIND_MATCH_FG:-}" \
-            "${ANSI_LIST[@]}" && \
-        echo "  OpenCode Desktop LevelDB journal written (takes effect on restart)"
-    fi
+    # ── 9. OpenCode CLI/TUI v2 native theme ────────────────────────────────
+    apply_opencode
 
     # ── 10. Antigravity.app (agent app, not editor fork) ────────────────────
     # Antigravity.app reads theme from ~/.gemini/config/config.json, not
@@ -834,44 +1335,8 @@ with open(path, "w") as f:
 PYEOF
     echo "Synced theme to $GEMINI_CONFIG (mode=$THEME_MODE)"
 
-    # ── 11. Codex ─────────────────────────────────────────────────────────────
-    # Codex has its own built-in syntax theme IDs — we always use "codex" and
-    # map the VS Code chrome colours to Codex's chrome theme so the chrome
-    # (sidebar, title bar, etc.) matches the editor.
-    CODEX_CONFIG="$HOME/.codex/config.toml"
-    if [ -f "$CODEX_CONFIG" ]; then
-        SURFACE=$(echo "$COLORS" | jq -r '.["titleBar.activeBackground"] // .["sideBar.background"] // .["activityBar.background"] // empty' | strip_alpha)
-        INK=$(echo "$COLORS" | jq -r '.["titleBar.activeForeground"] // .["sideBar.foreground"] // .["activityBar.foreground"] // empty' | strip_alpha)
-        [ -z "$SURFACE" ] && SURFACE="$BG"
-        [ -z "$INK" ]     && INK="$FG"
-
-        CODEX_PID=$(pgrep -f "codex app-server" 2>/dev/null)
-        [ -n "$CODEX_PID" ] && kill "$CODEX_PID" 2>/dev/null && sleep 1
-
-        python3 -c "
-import re
-with open('$CODEX_CONFIG') as f:
-    text = f.read()
-chrome_block = '''[desktop.appearanceDarkChromeTheme]
-accent = \"$ACCENT\"
-contrast = 60
-ink = \"$INK\"
-opaqueWindows = false
-surface = \"$SURFACE\"
-
-[desktop.appearanceDarkChromeTheme.semanticColors]
-diffAdded = \"${ANSI_Green:-#00a240}\"
-diffRemoved = \"${ANSI_Red:-#e02e2a}\"
-skill = \"${ANSI_Magenta:-#b06dff}\"
-'''
-text = re.sub(r'(?:\n|\A)\[desktop\].*', '', text, flags=re.DOTALL)
-text = text.rstrip() + '\n\n[desktop]\nappearanceDarkCodeThemeId = \"codex\"\n' + chrome_block
-with open('$CODEX_CONFIG', 'w') as f:
-    f.write(text)
-"
-        echo "Synced theme to $CODEX_CONFIG"
-        [ -n "$CODEX_PID" ] && echo "  (Codex daemon was stopped; restart it for the theme to apply)"
-    fi
+    # ── 11. Codex TUI native theme ─────────────────────────────────────────
+    apply_codex
 
     echo "Sync complete"
 }
@@ -923,7 +1388,6 @@ emit_payload_prelude() {
         val="${!v:-}"
         printf 'SYNC_%s=%q\n' "$v" "$val"
     done
-    printf 'SYNC_OPENCODE_PY_B64=%s\n' "$(base64 < "$SCRIPT_DIR/opencode_theme.py" | tr -d '\n')"
     printf 'SYNC_EXTENSION_TGZ_B64=%s\n' "$tgz_b64"
     printf 'SYNC_EXTENSION_NAME=%q\n' "$ext_name"
 }
@@ -942,9 +1406,6 @@ trap cleanup_receiver_tmp EXIT
 
 stage_remote_extras() {
     RECEIVER_TMP=$(mktemp -d "${TMPDIR:-/tmp}/sync-theme-receiver.XXXXXX")
-
-    OPENCODE_PY="$RECEIVER_TMP/opencode_theme.py"
-    printf '%s' "${SYNC_OPENCODE_PY_B64:-}" | _b64decode > "$OPENCODE_PY" 2>/dev/null
 
     EXTENSION_DIR=""
     if [ -n "${SYNC_EXTENSION_TGZ_B64:-}" ] && [ -n "${SYNC_EXTENSION_NAME:-}" ]; then
