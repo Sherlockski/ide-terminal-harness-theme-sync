@@ -373,7 +373,9 @@ print(','.join(uniq))
         BG=$(echo "$COLORS" | jq -r '.["editor.background"] // .["background"] // .["sideBar.background"] // .["activityBar.background"] // .["panel.background"] // empty' 2>/dev/null | strip_alpha)
     fi
     if [ -z "$BG" ]; then
-        case "${ACTIVE_THEME,,}" in
+        # NOTE: no ${VAR,,} here — macOS ships bash 3.2 and that expansion
+        # needs bash 4+. tr is portable.
+        case "$(printf '%s' "$ACTIVE_THEME" | tr '[:upper:]' '[:lower:]')" in
             *light*|*quiet*) BG="#F5F5F5" ;;
             *) BG="#1e1e1e" ;;
         esac
@@ -784,9 +786,8 @@ apply_hermes() {
     local HERMES_HOME_DIR="${HERMES_HOME:-$HOME/.hermes}"
     local SKIN="$HERMES_HOME_DIR/skins/sync-theme.yaml"
     mkdir -p "$(dirname "$SKIN")"
-    if [ -f "$SKIN" ]; then
-        cp -p "$SKIN" "$SKIN.bak-$(date +%Y%m%d)" 2>/dev/null || true
-    fi
+    local SKIN_BAK="$SKIN.bak-$(date +%Y%m%d)"
+    [ -f "$SKIN" ] && cp -p "$SKIN" "$SKIN_BAK" 2>/dev/null || true
 
     # NOTE: same shell-quirk guard as apply_herdr — never use ${VAR:-{}}.
     if [ -z "$COLORS" ]; then COLORS="{}"; fi
@@ -884,10 +885,21 @@ PYEOF
         echo "  [debug] hermes not on PATH — skin file written; activate with: hermes config set display.skin sync-theme"
     elif hermes config get display.skin 2>/dev/null | grep -q 'sync-theme'; then
         echo "  Hermes skin already active (sync-theme)"
-    elif hermes config set display.skin sync-theme 2>/dev/null; then
+    elif HERMES_ERR=$(hermes config set display.skin sync-theme 2>&1); then
         echo "  Hermes skin activated (sync-theme — surfaces repaint live)"
     else
-        echo "  [debug] hermes config set failed — skin file written; activate with: hermes config set display.skin sync-theme"
+        echo "  [debug] hermes config set failed (${HERMES_ERR:-unknown error}) — skin file written; activate with: hermes config set display.skin sync-theme"
+    fi
+
+    # A running TUI caches its skin in-process (no file watcher); it only
+    # re-reads on /skin <name> or restart. Say so when the palette moved.
+    if [ -f "$SKIN_BAK" ]; then
+        if cmp -s "$SKIN" "$SKIN_BAK"; then SKIN_CHANGED=0; else SKIN_CHANGED=1; fi
+    else
+        SKIN_CHANGED=1
+    fi
+    if [ "$SKIN_CHANGED" = 1 ]; then
+        echo "  [note] running Hermes TUIs repaint with in-session /skin sync-theme (or restart)"
     fi
 }
 
@@ -1233,6 +1245,7 @@ apply_targets() {
     fi
 
     # Write colors inline in the main config (no separate theme file needed)
+    mkdir -p "$(dirname "$GHOSTTY_CONFIG")"
     {
         echo ""
         echo "# BEGIN SYNC_THEME"
@@ -1520,6 +1533,14 @@ main() {
         apply-remote)
             # Receiver side of an SSH push: colours arrive via the payload
             # prelude; never touch the network or local detection here.
+            # Non-interactive sshd rarely sources profile files, so prefer
+            # ~/.local/bin (herdr, hermes, editor CLIs) on PATH when present.
+            if [ -d "$HOME/.local/bin" ]; then
+                case ":$PATH:" in
+                    *":$HOME/.local/bin:"*) ;;
+                    *) PATH="$HOME/.local/bin:$PATH" ;;
+                esac
+            fi
             for cmd in python3 jq; do
                 command -v "$cmd" >/dev/null 2>&1 || {
                     echo "sync_theme receiver: missing dependency: $cmd" >&2
